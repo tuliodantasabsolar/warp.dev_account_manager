@@ -8,14 +8,22 @@ import requests
 import time
 import subprocess
 import os
-import winreg
+try:
+    import winreg  # Windows-only
+except Exception:
+    winreg = None
 import psutil
 import urllib3
 from pathlib import Path
 from datetime import datetime, timezone
 from languages import get_language_manager, _
 from warp_bridge_server import WarpBridgeServer
-from windows_bridge_config import WindowsBridgeConfig
+try:
+    from windows_bridge_config import WindowsBridgeConfig  # Windows-only
+except Exception:
+    WindowsBridgeConfig = None
+import platform
+IS_WINDOWS = sys.platform == "win32"
 
 # SSL uyarılarını gizle (mitmproxy kullanırken)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -306,6 +314,9 @@ class WindowsProxyManager:
     @staticmethod
     def set_proxy(proxy_server):
         """Windows proxy ayarını etkinleştir"""
+        if not IS_WINDOWS or winreg is None:
+            # On non-Windows, do nothing and report success (handled by env/proxy settings)
+            return True
         try:
             # Registry anahtarını aç
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -334,6 +345,8 @@ class WindowsProxyManager:
     @staticmethod
     def disable_proxy():
         """Windows proxy ayarını devre dışı bırak"""
+        if not IS_WINDOWS or winreg is None:
+            return True
         try:
             # Registry anahtarını aç
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -352,6 +365,8 @@ class WindowsProxyManager:
     @staticmethod
     def is_proxy_enabled():
         """Proxy'nin etkin olup olmadığını kontrol et"""
+        if not IS_WINDOWS or winreg is None:
+            return False
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
@@ -370,7 +385,8 @@ class CertificateManager:
 
     def __init__(self):
         self.mitmproxy_dir = Path.home() / ".mitmproxy"
-        self.cert_file = self.mitmproxy_dir / "mitmproxy-ca-cert.cer"
+        # Windows uses .cer, Linux commonly uses .pem
+        self.cert_file = self.mitmproxy_dir / ("mitmproxy-ca-cert.cer" if IS_WINDOWS else "mitmproxy-ca-cert.pem")
 
     def check_certificate_exists(self):
         """Sertifika dosyası var mı kontrol et"""
@@ -383,7 +399,7 @@ class CertificateManager:
 
 
     def install_certificate_automatically(self):
-        """Sertifikayı otomatik olarak Windows'a kur"""
+        """Sertifikayı otomatik olarak sisteme kur (Windows). Linux'ta sadece yol göster."""
         try:
             cert_path = self.get_certificate_path()
             if not self.check_certificate_exists():
@@ -392,16 +408,21 @@ class CertificateManager:
 
             print(_('cert_installing'))
 
-            # certutil komutu ile sertifikayı root store'a ekle
-            cmd = ["certutil", "-addstore", "root", cert_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-
-            if result.returncode == 0:
-                print(_('cert_installed_success'))
-                return True
+            if IS_WINDOWS:
+                # certutil komutu ile sertifikayı root store'a ekle
+                cmd = ["certutil", "-addstore", "root", cert_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+                if result.returncode == 0:
+                    print(_('cert_installed_success'))
+                    return True
+                else:
+                    print(_('cert_install_error').format(result.stderr))
+                    return False
             else:
-                print(_('cert_install_error').format(result.stderr))
-                return False
+                # Linux: kullanıcıya manuel adımları göster (system-wide CA store değişkenlik gösterir)
+                print("Linux: Please trust mitmproxy certificate manually, e.g. for Firefox/Chrome profile.")
+                print(f"Certificate path: {cert_path}")
+                return True
 
         except Exception as e:
             print(_('cert_install_error').format(str(e)))
@@ -435,8 +456,10 @@ class MitmProxyManager:
                     if parent_window:
                         parent_window.status_bar.showMessage(_('cert_creating'), 0)
 
-                    temp_process = subprocess.Popen(temp_cmd, stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+                    popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+                    if IS_WINDOWS and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    temp_process = subprocess.Popen(temp_cmd, **popen_kwargs)
 
                     # 5 saniye bekle ve süreci sonlandır
                     time.sleep(5)
@@ -724,7 +747,12 @@ class ManualCertificateDialog(QDialog):
             import os
             cert_dir = os.path.dirname(self.cert_path)
             if os.path.exists(cert_dir):
-                subprocess.Popen(['explorer', cert_dir])
+                if IS_WINDOWS:
+                    subprocess.Popen(['explorer', cert_dir])
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', cert_dir])
+                else:
+                    subprocess.Popen(['xdg-open', cert_dir])
             else:
                 QMessageBox.warning(self, _('error'), _('certificate_not_found'))
         except Exception as e:
@@ -910,9 +938,9 @@ class TokenRefreshWorker(QThread):
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {access_token}',
                 'X-Warp-Client-Version': 'v0.2025.08.27.08.11.stable_04',
-                'X-Warp-Os-Category': 'Windows',
-                'X-Warp-Os-Name': 'Windows',
-                'X-Warp-Os-Version': '10 (19045)',
+                'X-Warp-Os-Category': ('Windows' if IS_WINDOWS else 'Linux'),
+                'X-Warp-Os-Name': ('Windows' if IS_WINDOWS else 'Linux'),
+                'X-Warp-Os-Version': ('10 (19045)' if IS_WINDOWS else platform.release()),
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'X-Warp-Manager-Request': 'true'  # Bizim uygulamamızdan gelen istek
@@ -981,10 +1009,10 @@ class TokenRefreshWorker(QThread):
                             "version": "v0.2025.08.27.08.11.stable_04"
                         },
                         "osContext": {
-                            "category": "Windows",
-                            "linuxKernelVersion": None,
-                            "name": "Windows",
-                            "version": "10 (19045)"
+                            "category": ("Windows" if IS_WINDOWS else "Linux"),
+                            "linuxKernelVersion": (None if IS_WINDOWS else platform.release()),
+                            "name": ("Windows" if IS_WINDOWS else "Linux"),
+                            "version": ("10 (19045)" if IS_WINDOWS else platform.release())
                         }
                     }
                 },
@@ -1420,7 +1448,7 @@ class MainWindow(QMainWindow):
         self.proxy_enabled = False
 
         # Proxy kapalıysa aktif hesabı temizle
-        if not WindowsProxyManager.is_proxy_enabled():
+        if IS_WINDOWS and WindowsProxyManager and not WindowsProxyManager.is_proxy_enabled():
             self.account_manager.clear_active_account()
 
         # Bridge sinyalini slot'a bağla
@@ -1469,13 +1497,12 @@ class MainWindow(QMainWindow):
         try:
             print("🌉 Bridge sistemi başlatılıyor...")
 
-            # Windows bridge konfigürasyonu kontrol et
-            bridge_config = WindowsBridgeConfig()
-
-            # İlk açılışta konfigürasyon kontrolü
-            if not bridge_config.check_configuration():
-                print("⚙️  Bridge konfigürasyonu yapılıyor...")
-                bridge_config.setup_bridge_config()
+            # Windows bridge konfigürasyonu kontrol et (Windows'ta)
+            if IS_WINDOWS and WindowsBridgeConfig is not None:
+                bridge_config = WindowsBridgeConfig()
+                if not bridge_config.check_configuration():
+                    print("⚙️  Bridge konfigürasyonu yapılıyor...")
+                    bridge_config.setup_bridge_config()
 
             # Bridge server başlat (callback ile tablo yenileme)
             self.bridge_server = WarpBridgeServer(
@@ -2004,11 +2031,17 @@ class MainWindow(QMainWindow):
                 progress.setLabelText(_('proxy_configuring'))
                 QApplication.processEvents()
 
-                # Windows proxy ayarlarını etkinleştir
                 proxy_url = self.proxy_manager.get_proxy_url()
                 print(f"Proxy URL: {proxy_url}")
 
-                if WindowsProxyManager.set_proxy(proxy_url):
+                ok = True
+                if IS_WINDOWS and WindowsProxyManager is not None:
+                    ok = WindowsProxyManager.set_proxy(proxy_url)
+                else:
+                    # Linux: kullanıcıya tarayıcı/proxy ayarı bilgisini göster
+                    self.status_bar.showMessage(f"Set your system/browser proxy to {proxy_url}", 5000)
+
+                if ok:
                     progress.setLabelText(_('activating_account').format(email))
                     QApplication.processEvents()
 
@@ -2064,11 +2097,16 @@ class MainWindow(QMainWindow):
                 progress.setLabelText(_('proxy_configuring'))
                 QApplication.processEvents()
 
-                # Windows proxy ayarlarını etkinleştir
                 proxy_url = self.proxy_manager.get_proxy_url()
                 print(f"Proxy URL: {proxy_url}")
 
-                if WindowsProxyManager.set_proxy(proxy_url):
+                ok = True
+                if IS_WINDOWS and WindowsProxyManager is not None:
+                    ok = WindowsProxyManager.set_proxy(proxy_url)
+                else:
+                    self.status_bar.showMessage(f"Set your system/browser proxy to {proxy_url}", 5000)
+
+                if ok:
                     progress.close()
 
                     self.proxy_enabled = True
@@ -2105,7 +2143,8 @@ class MainWindow(QMainWindow):
         """Proxy'yi durdur"""
         try:
             # Windows proxy ayarlarını devre dışı bırak
-            WindowsProxyManager.disable_proxy()
+            if IS_WINDOWS and WindowsProxyManager is not None:
+                WindowsProxyManager.disable_proxy()
 
             # Mitmproxy'yi durdur
             self.proxy_manager.stop()
