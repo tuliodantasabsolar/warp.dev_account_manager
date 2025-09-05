@@ -962,7 +962,7 @@ class MitmProxyManager:
                     parent_window.status_bar.showMessage(_('cert_installed_success'), 3000)
 
                     # macOS'ta ek olarak sertifika güvenini kontrol et
-                    if sys.platform == "darwin":
+                    if IS_MACOS:
                         if not self.cert_manager.verify_certificate_trust_macos():
                             print("⚠️ Certificate may not be fully trusted. Manual verification recommended.")
                             parent_window.status_bar.showMessage("Certificate installed but may need manual trust setup", 5000)
@@ -1038,7 +1038,7 @@ class MitmProxyManager:
                     print(f"Mitmproxy started successfully (PID: {self.process.pid})")
 
                     # On macOS, proactively check for TLS issues if in debug mode
-                    if sys.platform == "darwin" and self.debug_mode:
+                    if IS_MACOS and self.debug_mode:
                         print("\n🔍 Running TLS diagnosis (macOS debug mode)...")
                         time.sleep(1)  # Give mitmproxy time to start
                         self.diagnose_tls_issues()
