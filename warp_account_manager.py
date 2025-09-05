@@ -8,14 +8,25 @@ import requests
 import time
 import subprocess
 import os
-import winreg
 import psutil
 import urllib3
 from pathlib import Path
 from datetime import datetime, timezone
 from languages import get_language_manager, _
 from warp_bridge_server import WarpBridgeServer
-from windows_bridge_config import WindowsBridgeConfig
+
+# Platform-specific imports
+if sys.platform == "win32":
+    import winreg
+    from windows_bridge_config import WindowsBridgeConfig
+elif sys.platform == "darwin":
+    # macOS - no winreg needed
+    winreg = None
+    from macos_bridge_config import MacOSBridgeConfig as WindowsBridgeConfig
+else:
+    # Linux or other platforms
+    winreg = None
+    WindowsBridgeConfig = None
 
 # SSL uyarılarını gizle (mitmproxy kullanırken)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,6 +36,31 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                              QProgressDialog, QAbstractItemView, QStatusBar, QMenu, QAction, QScrollArea, QComboBox, QTabWidget)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt5.QtGui import QFont
+
+
+def get_os_info():
+    """Get operating system information for API headers"""
+    import platform
+    
+    if sys.platform == "win32":
+        return {
+            'category': 'Windows',
+            'name': 'Windows', 
+            'version': f'{platform.release()} ({platform.version()})'
+        }
+    elif sys.platform == "darwin":
+        return {
+            'category': 'Darwin',
+            'name': 'macOS',
+            'version': platform.mac_ver()[0]
+        }
+    else:
+        # Linux or other
+        return {
+            'category': 'Linux',
+            'name': platform.system(),
+            'version': platform.release()
+        }
 
 
 def load_stylesheet(app):
@@ -300,59 +336,309 @@ class AccountManager:
             return False
 
 
-class WindowsProxyManager:
-    """Windows proxy ayarlarını yönetir"""
+class ProxyManager:
+    """Cross-platform proxy settings manager"""
 
     @staticmethod
     def set_proxy(proxy_server):
-        """Windows proxy ayarını etkinleştir"""
+        """Enable proxy settings"""
+        if sys.platform == "win32":
+            return ProxyManager._set_proxy_windows(proxy_server)
+        elif sys.platform == "darwin":
+            return ProxyManager._set_proxy_macos(proxy_server)
+        else:
+            # Linux - could be implemented later
+            print("Proxy configuration not supported on this platform")
+            return False
+
+    @staticmethod
+    def _set_proxy_windows(proxy_server):
+        """Windows proxy configuration using registry"""
         try:
-            # Registry anahtarını aç
+            if winreg is None:
+                return False
+                
+            # Registry key opening
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
                                0, winreg.KEY_SET_VALUE)
 
-            # Proxy ayarlarını yap
+            # Set proxy settings
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_server)
 
             winreg.CloseKey(key)
 
-            # Internet Explorer ayarlarını yenile (sessizce)
+            # Refresh Internet Explorer settings (silently)
             try:
                 subprocess.run(["rundll32.exe", "wininet.dll,InternetSetOption", "0", "37", "0", "0"],
                              shell=True, capture_output=True, timeout=5)
             except:
-                # Eğer sessiz yenileme çalışmazsa, kullanıcıya bilgi ver
+                # If silent refresh doesn't work, inform user
                 pass
 
             return True
         except Exception as e:
-            print(f"Proxy ayarlama hatası: {e}")
+            print(f"Proxy setup error: {e}")
+            return False
+
+    @staticmethod
+    def _set_proxy_macos(proxy_server):
+        """macOS proxy configuration using networksetup with PAC file approach"""
+        try:
+            host, port = proxy_server.split(":")
+            
+            # Create PAC file for selective proxy - only Warp domains
+            pac_content = f"""function FindProxyForURL(url, host) {{
+    // Redirect only Warp-related domains through proxy
+    if (shExpMatch(host, "*.warp.dev") || 
+        shExpMatch(host, "*warp.dev") ||
+        shExpMatch(host, "*.dataplane.rudderstack.com") ||
+        shExpMatch(host, "*dataplane.rudderstack.com")) {{
+        return "PROXY {host}:{port}";
+    }}
+    
+    // All other traffic goes direct (preserving internet access)
+    return "DIRECT";
+}}"""
+            
+            # Write PAC file
+            import tempfile
+            import os
+            pac_dir = os.path.expanduser("~/.warp_proxy")
+            os.makedirs(pac_dir, exist_ok=True)
+            pac_file = os.path.join(pac_dir, "warp_proxy.pac")
+            
+            with open(pac_file, 'w') as f:
+                f.write(pac_content)
+            
+            print(f"PAC file created: {pac_file}")
+            
+            # Get active network service
+            result = subprocess.run(["networksetup", "-listnetworkserviceorder"], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                print("Failed to get network services")
+                return False
+            
+            # Find the first active service (usually Wi-Fi or Ethernet)
+            services = []
+            for line in result.stdout.split('\n'):
+                if line.startswith('(') and ')' in line:
+                    service_name = line.split(') ')[1] if ') ' in line else None
+                    if service_name and service_name not in ['Bluetooth PAN', 'Thunderbolt Bridge']:
+                        services.append(service_name)
+            
+            if not services:
+                print("No suitable network service found")
+                return False
+            
+            primary_service = services[0]
+            print(f"Configuring PAC proxy for service: {primary_service}")
+            
+            # Set Auto Proxy Configuration (PAC)
+            pac_url = f"file://{pac_file}"
+            result1 = subprocess.run(["networksetup", "-setautoproxyurl", primary_service, pac_url], 
+                                   capture_output=True, text=True, timeout=10)
+            
+            # Enable auto proxy
+            result2 = subprocess.run(["networksetup", "-setautoproxystate", primary_service, "on"], 
+                                   capture_output=True, text=True, timeout=10)
+            
+            if result1.returncode == 0 and result2.returncode == 0:
+                print(f"PAC proxy configured successfully: {proxy_server}")
+                print("✅ Internet access preserved - only Warp traffic goes through proxy")
+                return True
+            else:
+                print(f"PAC proxy configuration failed. PAC: {result1.stderr}, Enable: {result2.stderr}")
+                # Fallback to manual proxy if PAC fails
+                print("Falling back to manual proxy configuration...")
+                return ProxyManager._set_proxy_macos_manual(proxy_server)
+                
+        except Exception as e:
+            print(f"macOS PAC proxy setup error: {e}")
+            # Fallback to manual proxy
+            print("Falling back to manual proxy configuration...")
+            return ProxyManager._set_proxy_macos_manual(proxy_server)
+    
+    @staticmethod
+    def _set_proxy_macos_manual(proxy_server):
+        """macOS manual proxy configuration (fallback method)"""
+        try:
+            host, port = proxy_server.split(":")
+            
+            # Get active network service
+            result = subprocess.run(["networksetup", "-listnetworkserviceorder"], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                print("Failed to get network services")
+                return False
+            
+            # Find the first active service (usually Wi-Fi or Ethernet)
+            services = []
+            for line in result.stdout.split('\n'):
+                if line.startswith('(') and ')' in line:
+                    service_name = line.split(') ')[1] if ') ' in line else None
+                    if service_name and service_name not in ['Bluetooth PAN', 'Thunderbolt Bridge']:
+                        services.append(service_name)
+            
+            if not services:
+                print("No suitable network service found")
+                return False
+            
+            primary_service = services[0]
+            print(f"Configuring manual proxy for service: {primary_service}")
+            
+            # Set HTTP proxy
+            result1 = subprocess.run(["networksetup", "-setwebproxy", primary_service, host, port], 
+                                   capture_output=True, text=True, timeout=10)
+            
+            # Set HTTPS proxy
+            result2 = subprocess.run(["networksetup", "-setsecurewebproxy", primary_service, host, port], 
+                                   capture_output=True, text=True, timeout=10)
+            
+            if result1.returncode == 0 and result2.returncode == 0:
+                print(f"Manual proxy configured successfully: {proxy_server}")
+                print("⚠️ All HTTP/HTTPS traffic will go through proxy")
+                return True
+            else:
+                print(f"Manual proxy configuration failed. HTTP: {result1.stderr}, HTTPS: {result2.stderr}")
+                return False
+                
+        except Exception as e:
+            print(f"macOS manual proxy setup error: {e}")
             return False
 
     @staticmethod
     def disable_proxy():
-        """Windows proxy ayarını devre dışı bırak"""
+        """Disable proxy settings"""
+        if sys.platform == "win32":
+            return ProxyManager._disable_proxy_windows()
+        elif sys.platform == "darwin":
+            return ProxyManager._disable_proxy_macos()
+        else:
+            # Linux - could be implemented later
+            print("Proxy configuration not supported on this platform")
+            return False
+
+    @staticmethod
+    def _disable_proxy_windows():
+        """Disable Windows proxy settings"""
         try:
-            # Registry anahtarını aç
+            if winreg is None:
+                return False
+                
+            # Open registry key
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
                                0, winreg.KEY_SET_VALUE)
 
-            # Proxy'yi devre dışı bırak
+            # Disable proxy
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
 
             winreg.CloseKey(key)
             return True
         except Exception as e:
-            print(f"Proxy devre dışı bırakma hatası: {e}")
+            print(f"Proxy disable error: {e}")
+            return False
+
+    @staticmethod
+    def _disable_proxy_macos():
+        """Disable macOS proxy settings (both PAC and manual)"""
+        try:
+            # Get active network service
+            result = subprocess.run(["networksetup", "-listnetworkserviceorder"], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                print("Failed to get network services")
+                return False
+            
+            # Find the first active service
+            services = []
+            for line in result.stdout.split('\n'):
+                if line.startswith('(') and ')' in line:
+                    service_name = line.split(') ')[1] if ') ' in line else None
+                    if service_name and service_name not in ['Bluetooth PAN', 'Thunderbolt Bridge']:
+                        services.append(service_name)
+            
+            if not services:
+                print("No suitable network service found")
+                return False
+            
+            primary_service = services[0]
+            print(f"Disabling proxy for service: {primary_service}")
+            
+            success_count = 0
+            
+            # Disable Auto Proxy (PAC)
+            result1 = subprocess.run(["networksetup", "-setautoproxystate", primary_service, "off"], 
+                                   capture_output=True, text=True, timeout=10)
+            if result1.returncode == 0:
+                success_count += 1
+                print("✅ Auto Proxy (PAC) disabled")
+            else:
+                print(f"⚠️ Auto Proxy disable failed: {result1.stderr}")
+            
+            # Disable HTTP proxy
+            result2 = subprocess.run(["networksetup", "-setwebproxystate", primary_service, "off"], 
+                                   capture_output=True, text=True, timeout=10)
+            if result2.returncode == 0:
+                success_count += 1
+                print("✅ HTTP Proxy disabled")
+            else:
+                print(f"⚠️ HTTP Proxy disable failed: {result2.stderr}")
+            
+            # Disable HTTPS proxy
+            result3 = subprocess.run(["networksetup", "-setsecurewebproxystate", primary_service, "off"], 
+                                   capture_output=True, text=True, timeout=10)
+            if result3.returncode == 0:
+                success_count += 1
+                print("✅ HTTPS Proxy disabled")
+            else:
+                print(f"⚠️ HTTPS Proxy disable failed: {result3.stderr}")
+            
+            # Clean up PAC file
+            try:
+                import os
+                pac_file = os.path.expanduser("~/.warp_proxy/warp_proxy.pac")
+                if os.path.exists(pac_file):
+                    os.remove(pac_file)
+                    print("✅ PAC file cleaned up")
+            except Exception as e:
+                print(f"⚠️ PAC file cleanup failed: {e}")
+            
+            # Consider success if at least one proxy type was disabled
+            if success_count > 0:
+                print("Proxy disabled successfully")
+                return True
+            else:
+                print("Failed to disable any proxy settings")
+                return False
+                
+        except Exception as e:
+            print(f"macOS proxy disable error: {e}")
             return False
 
     @staticmethod
     def is_proxy_enabled():
-        """Proxy'nin etkin olup olmadığını kontrol et"""
+        """Check if proxy is enabled"""
+        if sys.platform == "win32":
+            return ProxyManager._is_proxy_enabled_windows()
+        elif sys.platform == "darwin":
+            return ProxyManager._is_proxy_enabled_macos()
+        else:
+            return False
+
+    @staticmethod
+    def _is_proxy_enabled_windows():
+        """Check if proxy is enabled on Windows"""
         try:
+            if winreg is None:
+                return False
+                
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
                                0, winreg.KEY_READ)
@@ -363,6 +649,58 @@ class WindowsProxyManager:
             return bool(proxy_enable)
         except:
             return False
+
+    @staticmethod
+    def _is_proxy_enabled_macos():
+        """Check if proxy is enabled on macOS (PAC or manual)"""
+        try:
+            # Get active network service
+            result = subprocess.run(["networksetup", "-listnetworkserviceorder"], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                return False
+            
+            # Find the first active service
+            services = []
+            for line in result.stdout.split('\n'):
+                if line.startswith('(') and ')' in line:
+                    service_name = line.split(') ')[1] if ') ' in line else None
+                    if service_name and service_name not in ['Bluetooth PAN', 'Thunderbolt Bridge']:
+                        services.append(service_name)
+            
+            if not services:
+                return False
+            
+            primary_service = services[0]
+            
+            # Check Auto Proxy (PAC) state
+            result1 = subprocess.run(["networksetup", "-getautoproxyurl", primary_service], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result1.returncode == 0:
+                if "Enabled: Yes" in result1.stdout:
+                    print("PAC proxy is enabled")
+                    return True
+            
+            # Check HTTP proxy state
+            result2 = subprocess.run(["networksetup", "-getwebproxy", primary_service], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result2.returncode == 0:
+                if "Enabled: Yes" in result2.stdout:
+                    print("HTTP proxy is enabled")
+                    return True
+            
+            return False
+                
+        except Exception as e:
+            print(f"macOS proxy check error: {e}")
+            return False
+
+
+# Backward compatibility alias
+ProxyManager = ProxyManager
 
 
 class CertificateManager:
@@ -380,6 +718,81 @@ class CertificateManager:
         """Sertifika dosya yolunu döndür"""
         return str(self.cert_file)
 
+    def verify_certificate_trust_macos(self):
+        """Verify if certificate is properly trusted on macOS"""
+        if sys.platform != "darwin":
+            return True
+            
+        try:
+            cert_path = self.get_certificate_path()
+            if not self.check_certificate_exists():
+                return False
+                
+            # Check if certificate is in keychain and trusted
+            cmd = ["security", "verify-cert", "-c", cert_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("✅ Certificate is properly trusted")
+                return True
+            else:
+                print(f"⚠️ Certificate trust verification failed: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            print(f"Certificate verification error: {e}")
+            return False
+
+    def fix_certificate_trust_macos(self):
+        """Attempt to fix certificate trust issues on macOS"""
+        if sys.platform != "darwin":
+            return True
+            
+        try:
+            cert_path = self.get_certificate_path()
+            if not self.check_certificate_exists():
+                print("❌ Certificate file not found")
+                return False
+            
+            print("🔧 Attempting to fix certificate trust...")
+            
+            # Method 1: Remove and re-add with explicit trust
+            print("Step 1: Removing existing certificate...")
+            cmd_remove = ["security", "delete-certificate", "-c", "mitmproxy"]
+            subprocess.run(cmd_remove, capture_output=True, text=True)
+            
+            # Method 2: Add with full trust settings
+            print("Step 2: Adding certificate with full trust...")
+            user_keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+            
+            # Import certificate
+            cmd_import = ["security", "import", cert_path, "-k", user_keychain, "-A"]
+            result_import = subprocess.run(cmd_import, capture_output=True, text=True)
+            
+            if result_import.returncode == 0:
+                # Set trust policy explicitly for SSL
+                cmd_trust = [
+                    "security", "add-trusted-cert", 
+                    "-d", "-r", "trustRoot",
+                    "-k", user_keychain,
+                    cert_path
+                ]
+                result_trust = subprocess.run(cmd_trust, capture_output=True, text=True)
+                
+                if result_trust.returncode == 0:
+                    print("✅ Certificate trust fixed successfully")
+                    return True
+                else:
+                    print(f"❌ Trust setting failed: {result_trust.stderr}")
+            else:
+                print(f"❌ Certificate import failed: {result_import.stderr}")
+            
+            return False
+            
+        except Exception as e:
+            print(f"Certificate trust fix error: {e}")
+            return False
+
 
 
     def install_certificate_automatically(self):
@@ -392,20 +805,97 @@ class CertificateManager:
 
             print(_('cert_installing'))
 
-            # certutil komutu ile sertifikayı root store'a ekle
-            cmd = ["certutil", "-addstore", "root", cert_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-
-            if result.returncode == 0:
-                print(_('cert_installed_success'))
-                return True
+            # Cross-platform certificate installation
+            if sys.platform == "win32":
+                # Windows: Use certutil
+                cmd = ["certutil", "-addstore", "root", cert_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+                
+                if result.returncode == 0:
+                    print(_('cert_installed_success'))
+                    return True
+                else:
+                    print(_('cert_install_error').format(result.stderr))
+                    return False
+                    
+            elif sys.platform == "darwin":
+                # macOS: Use security command with multiple strategies
+                
+                # Strategy 1: Try to add to system keychain with trust settings
+                print("Attempting to install certificate to system keychain...")
+                cmd_system = [
+                    "security", "add-trusted-cert", 
+                    "-d",  # Add to admin cert store
+                    "-r", "trustRoot",  # Set trust policy 
+                    "-k", "/Library/Keychains/System.keychain",
+                    cert_path
+                ]
+                result_system = subprocess.run(cmd_system, capture_output=True, text=True)
+                
+                if result_system.returncode == 0:
+                    print(_('cert_installed_success'))
+                    return True
+                else:
+                    print(f"System keychain failed: {result_system.stderr}")
+                
+                # Strategy 2: Add to login keychain with explicit trust
+                print("Attempting to install certificate to login keychain...")
+                user_keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+                
+                # First add the certificate
+                cmd_add = ["security", "add-cert", "-k", user_keychain, cert_path]
+                result_add = subprocess.run(cmd_add, capture_output=True, text=True)
+                
+                if result_add.returncode == 0:
+                    # Then set trust policy explicitly
+                    cmd_trust = [
+                        "security", "add-trusted-cert",
+                        "-d",  # Add to admin cert store 
+                        "-r", "trustRoot",  # Trust for SSL
+                        "-k", user_keychain,
+                        cert_path
+                    ]
+                    result_trust = subprocess.run(cmd_trust, capture_output=True, text=True)
+                    
+                    if result_trust.returncode == 0:
+                        print(_('cert_installed_success'))
+                        print("✅ Certificate installed and trusted in login keychain")
+                        return True
+                    else:
+                        print(f"Trust setting failed: {result_trust.stderr}")
+                else:
+                    print(f"Certificate add failed: {result_add.stderr}")
+                
+                # Strategy 3: Manual approach with user guidance
+                print("Automatic installation failed. Manual installation required.")
+                self._show_manual_certificate_instructions(cert_path)
+                return False
             else:
-                print(_('cert_install_error').format(result.stderr))
+                # Linux or other platforms
+                print("Certificate installation not supported on this platform")
                 return False
 
         except Exception as e:
             print(_('cert_install_error').format(str(e)))
             return False
+
+    def _show_manual_certificate_instructions(self, cert_path):
+        """Show manual certificate installation instructions for macOS"""
+        print("\n" + "="*60)
+        print("🔒 MANUAL CERTIFICATE INSTALLATION REQUIRED")
+        print("="*60)
+        print(f"Certificate location: {cert_path}")
+        print("\nPlease follow these steps:")
+        print("1. Open Keychain Access app (Applications → Utilities → Keychain Access)")
+        print("2. Drag the certificate file to the 'System' or 'login' keychain")
+        print("3. Double-click the installed certificate")
+        print("4. Expand 'Trust' section")
+        print("5. Set 'When using this certificate' to 'Always Trust'")
+        print("6. Close the window and enter your password when prompted")
+        print("\n🌐 For browsers like Chrome/Safari:")
+        print("7. Restart your browser")
+        print("8. The proxy should now work correctly")
+        print("\n" + "="*60)
 
 
 class MitmProxyManager:
@@ -425,6 +915,12 @@ class MitmProxyManager:
                 print("Mitmproxy zaten çalışıyor")
                 return True
 
+            # First, check if mitmproxy is properly installed
+            print("🔍 Checking mitmproxy installation...")
+            if not self.check_mitmproxy_installation():
+                print("❌ Mitmproxy installation check failed")
+                return False
+
             # İlk çalıştırmada sertifika kontrolü yap
             if not self.cert_manager.check_certificate_exists():
                 print(_('cert_creating'))
@@ -435,8 +931,13 @@ class MitmProxyManager:
                     if parent_window:
                         parent_window.status_bar.showMessage(_('cert_creating'), 0)
 
-                    temp_process = subprocess.Popen(temp_cmd, stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+                    # Platform-specific process creation
+                    if sys.platform == "win32":
+                        temp_process = subprocess.Popen(temp_cmd, stdout=subprocess.PIPE,
+                                                      stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        temp_process = subprocess.Popen(temp_cmd, stdout=subprocess.PIPE,
+                                                      stderr=subprocess.PIPE)
 
                     # 5 saniye bekle ve süreci sonlandır
                     time.sleep(5)
@@ -465,6 +966,12 @@ class MitmProxyManager:
                     # Sertifika başarıyla kurulduysa onayı kaydet
                     parent_window.account_manager.set_certificate_approved(True)
                     parent_window.status_bar.showMessage(_('cert_installed_success'), 3000)
+                    
+                    # macOS'ta ek olarak sertifika güvenini kontrol et
+                    if sys.platform == "darwin":
+                        if not self.cert_manager.verify_certificate_trust_macos():
+                            print("⚠️ Certificate may not be fully trusted. Manual verification recommended.")
+                            parent_window.status_bar.showMessage("Certificate installed but may need manual trust setup", 5000)
                 else:
                     # Otomatik kurulum başarısız - manuel kurulum dialogu göster
                     dialog_result = self.show_manual_certificate_dialog(parent_window)
@@ -487,51 +994,171 @@ class MitmProxyManager:
 
             print(f"Mitmproxy komutu: {' '.join(cmd)}")
 
-            # Süreç başlat - debug moduna göre konsol penceresi
+            # Start process - platform-specific console handling
             if sys.platform == "win32":
                 cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in cmd)
 
                 if self.debug_mode:
-                    # Debug modu: Konsol penceresi görünür
-                    print("Debug modu aktif - Mitmproxy konsol penceresi açılacak")
+                    # Debug mode: Console window visible
+                    print("Debug mode active - Mitmproxy console window will open")
                     self.process = subprocess.Popen(
                         f'start "Mitmproxy Console (Debug)" cmd /k "{cmd_str}"',
                         shell=True
                     )
                 else:
-                    # Normal mod: Konsol penceresi gizli
-                    print("Normal mod - Mitmproxy arka planda çalışacak")
+                    # Normal mode: Hidden console window
+                    print("Normal mode - Mitmproxy will run in background")
                     self.process = subprocess.Popen(
                         cmd_str,
                         shell=True,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
 
-                # Windows'ta start komutu hemen döner, bu yüzden port kontrolü yapalım
-                print("Mitmproxy başlatılıyor, port kontrol ediliyor...")
-                for i in range(10):  # 10 saniye bekle
+                # Windows start command returns immediately, so check port
+                print("Starting Mitmproxy, checking port...")
+                for i in range(10):  # Wait 10 seconds
                     time.sleep(1)
                     if self.is_port_open("127.0.0.1", self.port):
-                        print(f"Mitmproxy başarıyla başlatıldı - Port {self.port} açık")
+                        print(f"Mitmproxy started successfully - Port {self.port} is open")
                         return True
-                    print(f"Port kontrol ediliyor... ({i+1}/10)")
+                    print(f"Checking port... ({i+1}/10)")
 
-                print("Mitmproxy başlatılamadı - port açılmadı")
+                print("Failed to start Mitmproxy - port did not open")
                 return False
             else:
-                # Linux/Mac için normal başlatma
-                self.process = subprocess.Popen(cmd)
-                time.sleep(3)
+                # Linux/Mac normal startup
+                if self.debug_mode:
+                    print("Debug mode active - Mitmproxy will run in foreground")
+                    print("🔍 TLS issues? Run diagnosis with: proxy_manager.diagnose_tls_issues()")
+                    # On macOS/Linux, run in foreground for debug mode
+                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                else:
+                    print("Normal mode - Mitmproxy will run in background")
+                    # Run in background but capture errors for diagnosis
+                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    
+                # Wait a bit and check if process is still running
+                time.sleep(2)
+                
                 if self.process.poll() is None:
-                    print(f"Mitmproxy başlatıldı (PID: {self.process.pid})")
+                    print(f"Mitmproxy started successfully (PID: {self.process.pid})")
+                    
+                    # On macOS, proactively check for TLS issues if in debug mode
+                    if sys.platform == "darwin" and self.debug_mode:
+                        print("\n🔍 Running TLS diagnosis (macOS debug mode)...")
+                        time.sleep(1)  # Give mitmproxy time to start
+                        self.diagnose_tls_issues()
+                    
                     return True
                 else:
-                    print("Mitmproxy başlatılamadı")
+                    # Process terminated, get error output
+                    try:
+                        stdout, stderr = self.process.communicate(timeout=5)
+                        print(f"\n❌ Failed to start Mitmproxy - Process terminated")
+                        print(f"\n📝 Error Details:")
+                        if stderr:
+                            print(f"STDERR: {stderr.strip()}")
+                        if stdout:
+                            print(f"STDOUT: {stdout.strip()}")
+                        
+                        # Common solutions based on error patterns
+                        self._suggest_mitmproxy_solutions(stderr, stdout)
+                    except subprocess.TimeoutExpired:
+                        print("❌ Process communication timeout")
                     return False
 
         except Exception as e:
             print(f"Mitmproxy başlatma hatası: {e}")
             return False
+
+    def _suggest_mitmproxy_solutions(self, stderr, stdout):
+        """Suggest solutions based on mitmproxy error output"""
+        print("\n🛠️ Possible Solutions:")
+        
+        error_text = (stderr or '') + (stdout or '')
+        error_lower = error_text.lower()
+        
+        # Check for common issues
+        if 'permission denied' in error_lower or 'operation not permitted' in error_lower:
+            print("🔒 Permission Issue:")
+            print("   Try running with appropriate permissions")
+            print("   Or change to a different port: proxy_manager.port = 8081")
+            
+        elif 'address already in use' in error_lower or 'port' in error_lower:
+            print("🚫 Port Conflict:")
+            print("   Another process is using port 8080")
+            print("   Kill existing process or use different port")
+            print(f"   Check with: lsof -i :8080")
+            
+        elif 'no module named' in error_lower or 'modulenotfounderror' in error_lower:
+            print("📦 Missing Dependencies:")
+            print("   Install required packages:")
+            print("   pip3 install mitmproxy")
+            
+        elif 'command not found' in error_lower or 'no such file' in error_lower:
+            print("❌ Mitmproxy Not Found:")
+            print("   Install mitmproxy:")
+            print("   pip3 install mitmproxy")
+            print("   Or: brew install mitmproxy")
+            
+        elif 'certificate' in error_lower or 'ssl' in error_lower or 'tls' in error_lower:
+            print("🔒 Certificate Issue:")
+            print("   Run certificate diagnosis:")
+            print("   proxy_manager.diagnose_tls_issues()")
+            
+        elif 'script' in error_lower and 'warp_proxy_script' in error_lower:
+            print("📜 Script Issue:")
+            print("   Check if warp_proxy_script.py exists")
+            print("   Verify script has no syntax errors")
+            
+        else:
+            print("🔄 General Troubleshooting:")
+            print("1. Check if mitmproxy is installed: mitmdump --version")
+            print("2. Try running manually: mitmdump -p 8080")
+            print("3. Check system requirements and dependencies")
+            print("4. Verify warp_proxy_script.py exists and is valid")
+            
+        print("\n📞 For more help, check mitmproxy documentation")
+
+    def check_mitmproxy_installation(self):
+        """Check if mitmproxy is properly installed"""
+        print("\n🔍 MITMPROXY INSTALLATION CHECK")
+        print("="*50)
+        
+        # Check if mitmdump command exists
+        try:
+            result = subprocess.run(['mitmdump', '--version'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                print(f"✅ Mitmproxy installed: {result.stdout.strip()}")
+            else:
+                print(f"❌ Mitmproxy version check failed: {result.stderr}")
+                return False
+        except FileNotFoundError:
+            print("❌ Mitmproxy not found in PATH")
+            print("\n📝 Installation commands:")
+            print("   pip3 install mitmproxy")
+            print("   or: brew install mitmproxy")
+            return False
+        except subprocess.TimeoutExpired:
+            print("❌ Mitmproxy version check timed out")
+            return False
+            
+        # Check if warp_proxy_script.py exists
+        if os.path.exists(self.script_path):
+            print(f"✅ Proxy script found: {self.script_path}")
+        else:
+            print(f"❌ Proxy script missing: {self.script_path}")
+            return False
+            
+        # Check port availability
+        if not self.is_port_open("127.0.0.1", self.port):
+            print(f"✅ Port {self.port} is available")
+        else:
+            print(f"⚠️ Port {self.port} is already in use")
+            print("   Kill the process using this port or choose a different port")
+            
+        return True
 
     def stop(self):
         """Mitmproxy'yi durdur"""
@@ -578,6 +1205,44 @@ class MitmProxyManager:
     def get_proxy_url(self):
         """Proxy URL'ini döndür"""
         return f"127.0.0.1:{self.port}"
+
+    def diagnose_tls_issues(self):
+        """Diagnose TLS handshake issues and suggest solutions"""
+        print("\n" + "🔍" + " TLS HANDSHAKE DIAGNOSIS" + "\n" + "="*50)
+        
+        # Check certificate existence
+        if not self.cert_manager.check_certificate_exists():
+            print("❌ Certificate not found")
+            print("📝 Solution: Restart mitmproxy to generate certificate")
+            return False
+        
+        print("✅ Certificate file exists")
+        
+        if sys.platform == "darwin":
+            # macOS specific checks
+            print("\n🍎 macOS Certificate Trust Check:")
+            
+            if self.cert_manager.verify_certificate_trust_macos():
+                print("✅ Certificate is trusted by system")
+            else:
+                print("❌ Certificate is NOT trusted by system")
+                print("\n🛠️ Attempting automatic fix...")
+                
+                if self.cert_manager.fix_certificate_trust_macos():
+                    print("✅ Automatic fix successful!")
+                else:
+                    print("❌ Automatic fix failed")
+                    print("\n📝 Manual Fix Required:")
+                    self.cert_manager._show_manual_certificate_instructions(self.cert_manager.get_certificate_path())
+                    return False
+        
+        # Additional checks
+        print("\n🌐 Browser Recommendations:")
+        print("1. Chrome: Restart browser after certificate installation")
+        print("2. Safari: May require manual certificate approval in Keychain Access")
+        print("3. Firefox: Uses its own certificate store - may need separate installation")
+        
+        return True
 
     def is_port_open(self, host, port):
         """Port'un açık olup olmadığını kontrol et"""
@@ -719,12 +1384,18 @@ class ManualCertificateDialog(QDialog):
         self.setLayout(layout)
 
     def open_certificate_folder(self):
-        """Sertifika klasörünü dosya gezgininde aç"""
+        """Open certificate folder in file explorer"""
         try:
             import os
             cert_dir = os.path.dirname(self.cert_path)
             if os.path.exists(cert_dir):
-                subprocess.Popen(['explorer', cert_dir])
+                if sys.platform == "win32":
+                    subprocess.Popen(['explorer', cert_dir])
+                elif sys.platform == "darwin":
+                    subprocess.Popen(['open', cert_dir])
+                else:
+                    # Linux
+                    subprocess.Popen(['xdg-open', cert_dir])
             else:
                 QMessageBox.warning(self, _('error'), _('certificate_not_found'))
         except Exception as e:
@@ -905,17 +1576,20 @@ class TokenRefreshWorker(QThread):
         try:
             access_token = account_data['stsTokenManager']['accessToken']
 
+            # Get dynamic OS information
+            os_info = get_os_info()
+            
             url = "https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo"
             headers = {
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {access_token}',
                 'X-Warp-Client-Version': 'v0.2025.08.27.08.11.stable_04',
-                'X-Warp-Os-Category': 'Windows',
-                'X-Warp-Os-Name': 'Windows',
-                'X-Warp-Os-Version': '10 (19045)',
+                'X-Warp-Os-Category': os_info['category'],
+                'X-Warp-Os-Name': os_info['name'],
+                'X-Warp-Os-Version': os_info['version'],
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
-                'X-Warp-Manager-Request': 'true'  # Bizim uygulamamızdan gelen istek
+                'X-Warp-Manager-Request': 'true'  # Request from our application
             }
 
             query = """
@@ -981,10 +1655,10 @@ class TokenRefreshWorker(QThread):
                             "version": "v0.2025.08.27.08.11.stable_04"
                         },
                         "osContext": {
-                            "category": "Windows",
+                            "category": os_info['category'],
                             "linuxKernelVersion": None,
-                            "name": "Windows",
-                            "version": "10 (19045)"
+                            "name": os_info['category'],
+                            "version": os_info['version']
                         }
                     }
                 },
@@ -1420,7 +2094,7 @@ class MainWindow(QMainWindow):
         self.proxy_enabled = False
 
         # Proxy kapalıysa aktif hesabı temizle
-        if not WindowsProxyManager.is_proxy_enabled():
+        if not ProxyManager.is_proxy_enabled():
             self.account_manager.clear_active_account()
 
         # Bridge sinyalini slot'a bağla
@@ -2008,7 +2682,7 @@ class MainWindow(QMainWindow):
                 proxy_url = self.proxy_manager.get_proxy_url()
                 print(f"Proxy URL: {proxy_url}")
 
-                if WindowsProxyManager.set_proxy(proxy_url):
+                if ProxyManager.set_proxy(proxy_url):
                     progress.setLabelText(_('activating_account').format(email))
                     QApplication.processEvents()
 
@@ -2068,7 +2742,7 @@ class MainWindow(QMainWindow):
                 proxy_url = self.proxy_manager.get_proxy_url()
                 print(f"Proxy URL: {proxy_url}")
 
-                if WindowsProxyManager.set_proxy(proxy_url):
+                if ProxyManager.set_proxy(proxy_url):
                     progress.close()
 
                     self.proxy_enabled = True
@@ -2105,7 +2779,7 @@ class MainWindow(QMainWindow):
         """Proxy'yi durdur"""
         try:
             # Windows proxy ayarlarını devre dışı bırak
-            WindowsProxyManager.disable_proxy()
+            ProxyManager.disable_proxy()
 
             # Mitmproxy'yi durdur
             self.proxy_manager.stop()
@@ -2251,6 +2925,9 @@ class MainWindow(QMainWindow):
     def fetch_and_save_user_settings(self, email):
         """GetUpdatedCloudObjects API çağrısı yapıp user_settings.json olarak kaydet"""
         try:
+            # Get dynamic OS information
+            os_info = get_os_info()
+            
             # Aktif hesabın token'ini al
             accounts = self.account_manager.get_accounts()
             account_data = None
@@ -2272,9 +2949,9 @@ class MainWindow(QMainWindow):
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {access_token}',
                 'X-Warp-Client-Version': 'v0.2025.09.01.20.54.stable_04',
-                'X-Warp-Os-Category': 'Windows',
-                'X-Warp-Os-Name': 'Windows',
-                'X-Warp-Os-Version': '10 (19045)',
+                'X-Warp-Os-Category': os_info['category'],
+                'X-Warp-Os-Name': os_info['name'],
+                'X-Warp-Os-Version': os_info['version'],
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive'
@@ -2683,7 +3360,7 @@ class MainWindow(QMainWindow):
                     },
                     "requestContext": {
                         "clientContext": {"version": "v0.2025.09.01.20.54.stable_04"},
-                        "osContext": {"category": "Windows", "linuxKernelVersion": None, "name": "Windows", "version": "10 (19045)"}
+                        "osContext": {"category": os_info['category'], "linuxKernelVersion": None, "name": os_info['category'], "version": "10 (19045)"}
                     }
                 },
                 "operationName": "GetUpdatedCloudObjects"
@@ -2779,7 +3456,7 @@ class MainWindow(QMainWindow):
                 self.proxy_start_button.setText(_('proxy_start'))
                 self.proxy_stop_button.setVisible(False)  # Gizle
                 self.proxy_stop_button.setEnabled(False)
-                WindowsProxyManager.disable_proxy()
+                ProxyManager.disable_proxy()
                 self.account_manager.clear_active_account()
                 self.load_accounts(preserve_limits=True)
 
@@ -2910,6 +3587,9 @@ class MainWindow(QMainWindow):
     def _get_account_limit_info(self, account_data):
         """Hesabın limit bilgilerini Warp API'den al"""
         try:
+            # Get dynamic OS information
+            os_info = get_os_info()
+            
             access_token = account_data['stsTokenManager']['accessToken']
 
             url = "https://app.warp.dev/graphql/v2?op=GetRequestLimitInfo"
@@ -2917,9 +3597,9 @@ class MainWindow(QMainWindow):
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {access_token}',
                 'X-Warp-Client-Version': 'v0.2025.08.27.08.11.stable_04',
-                'X-Warp-Os-Category': 'Windows',
-                'X-Warp-Os-Name': 'Windows',
-                'X-Warp-Os-Version': '10 (19045)',
+                'X-Warp-Os-Category': os_info['category'],
+                'X-Warp-Os-Name': os_info['name'],
+                'X-Warp-Os-Version': os_info['version'],
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'X-Warp-Manager-Request': 'true'
@@ -2988,10 +3668,10 @@ class MainWindow(QMainWindow):
                             "version": "v0.2025.08.27.08.11.stable_04"
                         },
                         "osContext": {
-                            "category": "Windows",
+                            "category": os_info['category'],
                             "linuxKernelVersion": None,
-                            "name": "Windows",
-                            "version": "10 (19045)"
+                            "name": os_info['category'],
+                            "version": os_info['version']
                         }
                     }
                 },
