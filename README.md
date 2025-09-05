@@ -6,6 +6,10 @@ This extension allows you to easily switch between your accounts.
 - No ban issues
 - Custom chrome extension
 
+- Windows (Tested)
+- MacOS (PR)
+- Linux (PR)
+
 ## NOTE
 
 This project is designed to facilitate the use of Warp.dev. No responsibility is accepted.
