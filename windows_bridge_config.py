@@ -11,7 +11,7 @@ import sys
 import json
 from pathlib import Path
 
-class WindowsBridgeConfig:
+class BridgeConfig:
     def __init__(self):
         self.extension_id = "warp-account-bridge-v1"
         self.app_name = "com.warp.account.bridge"
@@ -175,17 +175,17 @@ class WindowsBridgeConfig:
 
 def setup_bridge():
     """Setup bridge configuration"""
-    config = WindowsBridgeConfig()
+    config = BridgeConfig()
     return config.setup_bridge_config()
 
 def check_bridge():
     """Check bridge configuration"""
-    config = WindowsBridgeConfig()
+    config = BridgeConfig()
     return config.check_configuration()
 
 def remove_bridge():
     """Remove bridge configuration"""
-    config = WindowsBridgeConfig()
+    config = BridgeConfig()
     return config.remove_configuration()
 
 

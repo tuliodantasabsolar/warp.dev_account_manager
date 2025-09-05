@@ -322,6 +322,7 @@ def is_relevant_request(flow: http.HTTPFlow) -> bool:
         "dataplane.rudderstack.com"  # Bloklamak için
     ]
 
+    # Warp ile ilgili olmayan istekleri sessizce geçir (internet erişimini engelleme)
     if not any(domain in flow.request.pretty_host for domain in relevant_domains):
         return False
 
@@ -331,8 +332,9 @@ def is_relevant_request(flow: http.HTTPFlow) -> bool:
 def request(flow: http.HTTPFlow) -> None:
     """İstek yakalandığında çalışır"""
 
-    # İlgisiz istekleri hemen filtrele - sessizce geç
+    # İlgisiz istekleri hemen filtrele - sessizce geç (internet erişimine müdahale etme)
     if not is_relevant_request(flow):
+        # Warp ile ilgili olmayan tüm trafiği direkt geçir
         return
 
     request_url = flow.request.pretty_url
@@ -431,7 +433,7 @@ def response(flow: http.HTTPFlow) -> None:
     if "app.warp.dev" not in flow.request.pretty_host:
         return
 
-    # İlgisiz istekleri hemen filtrele - sessizce geç
+    # İlgisiz istekleri hemen filtrele - sessizce geç (internet erişimine müdahale etme)
     if not is_relevant_request(flow):
         return
 
